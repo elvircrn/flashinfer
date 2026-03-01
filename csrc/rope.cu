@@ -398,24 +398,28 @@ void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(q_rope_out.dtype(), c_quant_type, [&] {
       return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids.dtype(), c_idtype, [&] {
-        cudaError_t status = RopeQuantize(
-            static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
-            static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
-            static_cast<c_quant_type*>(q_rope_out.data_ptr()),
-            static_cast<c_quant_type*>(k_rope_out.data_ptr()),
-            static_cast<c_quant_type*>(q_nope_out.data_ptr()),
-            static_cast<c_quant_type*>(k_nope_out.data_ptr()),
-            static_cast<float*>(cos_sin_cache.data_ptr()),
-            static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rope_dim,
-            no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
-            q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
-            q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
-            k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
-            k_nope_out_stride_h, quant_scale_q, quant_scale_kv, interleave, enable_pdl, stream);
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(cos_sin_cache.dtype(), c_cache_type, [&] {
+          cudaError_t status = RopeQuantize(
+              static_cast<c_type*>(q_rope_in.data_ptr()),
+              static_cast<c_type*>(k_rope_in.data_ptr()),
+              static_cast<c_type*>(q_nope_in.data_ptr()),
+              static_cast<c_type*>(k_nope_in.data_ptr()),
+              static_cast<c_quant_type*>(q_rope_out.data_ptr()),
+              static_cast<c_quant_type*>(k_rope_out.data_ptr()),
+              static_cast<c_quant_type*>(q_nope_out.data_ptr()),
+              static_cast<c_quant_type*>(k_nope_out.data_ptr()),
+              static_cast<c_cache_type*>(cos_sin_cache.data_ptr()),
+              static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rope_dim,
+              no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
+              q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
+              q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
+              k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
+              k_nope_out_stride_h, quant_scale_q, quant_scale_kv, interleave, enable_pdl, stream);
 
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "RopeQuantize failed with error code " << cudaGetErrorString(status);
-        return true;
+          TVM_FFI_ICHECK(status == cudaSuccess)
+              << "RopeQuantize failed with error code " << cudaGetErrorString(status);
+          return true;
+        });
       });
     });
   });

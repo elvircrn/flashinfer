@@ -1334,7 +1334,8 @@ def rope_quantize_fp8(
         For MLA: ``(nnz, no_rope_dim)``. If ``None``, treated as zero-dim and created internally.
     cos_sin_cache : torch.Tensor
         Precomputed cosine and sine values, shape: ``(max_seq_len, rope_dim)``.
-        First half contains cosine values, second half contains sine values. Must be float32.
+        First half contains cosine values, second half contains sine values.
+        Supported dtypes: float32, float16, bfloat16.
     pos_ids : torch.Tensor
         Position indices for each token, shape: ``(nnz,)``.
     is_neox : bool
@@ -1363,8 +1364,8 @@ def rope_quantize_fp8(
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
-    if cos_sin_cache.dtype != torch.float32:
-        raise ValueError("cos_sin_cache should be float32")
+    if cos_sin_cache.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("cos_sin_cache should be float32, float16, or bfloat16")
 
     # Allow None for nope tensors and normalize to size-0 tensors with correct shapes
     nnz = q_rope.shape[0]
@@ -1484,7 +1485,8 @@ def rope_quantize_fp8_append_paged_kv_cache(
         For MLA: pass ``None`` (MLA does not use separate V; K non-RoPE acts as compressed KV).
     cos_sin_cache : torch.Tensor
         Precomputed cosine and sine values, shape: ``(max_seq_len, rope_dim)``.
-        First half contains cosine values, second half contains sine values. Must be float32.
+        First half contains cosine values, second half contains sine values.
+        Supported dtypes: float32, float16, bfloat16.
     pos_ids : torch.Tensor
         Position indices for each token, shape: ``(nnz,)``.
     paged_kv_cache : Tuple[torch.Tensor, torch.Tensor]
@@ -1541,8 +1543,8 @@ def rope_quantize_fp8_append_paged_kv_cache(
       ``flashinfer.get_batch_indices_positions()``.
     - Cache tensors must already be allocated in the target FP8 dtype.
     """
-    if cos_sin_cache.dtype != torch.float32:
-        raise ValueError("cos_sin_cache should be float32")
+    if cos_sin_cache.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("cos_sin_cache should be float32, float16, or bfloat16")
 
     # Detect architecture
     is_mla = k_rope.ndim == 2

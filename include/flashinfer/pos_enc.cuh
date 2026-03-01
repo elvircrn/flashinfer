@@ -425,11 +425,11 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
 }
 
 template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
-          typename QuantType>
+          typename QuantType, typename CSCacheType = float>
 __global__ void RopeQuantizeKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
     QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
-    float* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    CSCacheType* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim, uint32_t no_rope_dim,
     size_t q_rope_in_stride_n, size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
     size_t q_nope_in_stride_h, size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
@@ -474,8 +474,8 @@ __global__ void RopeQuantizeKernel(
       } else {
         vec_idx = (tx * vec_size) % half_rope_dim;  // Use half_rotary_dim
       }
-      cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
+      cos.cast_load(cos_sin_cache + (pos * rope_dim) + vec_idx);
+      sin.cast_load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
     }
 
     if (by < q_rope_end) {
@@ -1029,10 +1029,10 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 #endif
 }
 
-template <typename DType, typename IdType, typename QuantType>
+template <typename DType, typename IdType, typename QuantType, typename CSCacheType = float>
 cudaError_t RopeQuantize(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
-    QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out, float* cos_sin_cache,
+    QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out, CSCacheType* cos_sin_cache,
     IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim,
     uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
     size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
@@ -1092,7 +1092,7 @@ cudaError_t RopeQuantize(
                     (void*)&k_nope_out_stride_h,
                     (void*)&quant_scale_q,
                     (void*)&quant_scale_kv};
-    auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, 1, DType, IdType, QuantType>;
+    auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, 1, DType, IdType, QuantType, CSCacheType>;
     dim3 nblks(nblks_x, total_blocks_y);
     dim3 nthrs(bdx, bdy);
 

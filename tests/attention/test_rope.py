@@ -385,6 +385,9 @@ def test_rope_cos_sin_cache(
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize(
+    "cos_sin_cache_dtype", [torch.float32, torch.float16, torch.bfloat16]
+)
 def test_generalized_rope_quantize(
     attention_type,
     num_qo_heads,
@@ -395,6 +398,7 @@ def test_generalized_rope_quantize(
     input_dtype,
     quant_dtype,
     enable_pdl,
+    cos_sin_cache_dtype,
 ):
     """Test generalized rope + quantization for MLA, GQA, and MHA architectures."""
     device = "cuda:0"
@@ -431,7 +435,12 @@ def test_generalized_rope_quantize(
         device,
     )
 
-    # Compute reference output
+    # Cast cos_sin_cache to test dtype before computing reference so both
+    # reference and kernel use the same precision cos/sin values.
+    cos_sin_cache = rope_flashinfer.cos_sin_cache.to(cos_sin_cache_dtype)
+    rope_flashinfer.cos_sin_cache = cos_sin_cache.float()
+
+    # Compute reference output (uses the rounded cos_sin values)
     q_out_f16_ref, k_out_f16_ref = rope_flashinfer.forward_native(pos_ids, q_in, k_in)
     q_out_f8_ref, k_out_f8_ref = map(
         lambda x: x.to(quant_dtype),
@@ -460,7 +469,7 @@ def test_generalized_rope_quantize(
         k_rope_in,
         q_nope_in,
         k_nope_in,
-        rope_flashinfer.cos_sin_cache,
+        cos_sin_cache,
         pos_ids,
         is_neox=False,
         q_rope_out=q_rope_out,
@@ -1384,11 +1393,15 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize(
+    "cos_sin_cache_dtype", [torch.float32, torch.float16, torch.bfloat16]
+)
 def test_mla_rope_quantize(
     num_tokens,
     input_dtype,
     quant_dtype,
     enable_pdl,
+    cos_sin_cache_dtype,
 ):
     device = "cuda:0"
     # Fixed seed for reproducibility across tests
@@ -1411,6 +1424,11 @@ def test_mla_rope_quantize(
         device,
     )
 
+    # Cast cos_sin_cache to test dtype before computing reference so both
+    # reference and kernel use the same precision cos/sin values.
+    cos_sin_cache = rope_flashinfer.cos_sin_cache.to(cos_sin_cache_dtype)
+    rope_flashinfer.cos_sin_cache = cos_sin_cache.float()
+
     q_out_f16_ref, k_out_f16_ref = rope_flashinfer.forward_native(pos_ids, q_in, k_in)
     q_out_f8_ref, k_out_f8_ref = map(
         lambda x: x.to(quant_dtype),
@@ -1424,7 +1442,7 @@ def test_mla_rope_quantize(
         k_in[..., :64],
         q_in[..., 64:],
         k_in[..., 64:],
-        rope_flashinfer.cos_sin_cache,
+        cos_sin_cache,
         pos_ids,
         is_neox=False,
         q_rope_out=q_out[..., :64],
