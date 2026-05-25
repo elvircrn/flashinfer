@@ -6449,8 +6449,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
 group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 
 
-# NOTE: Just 120/121 support has been added, but it is trivial to generalize
-@supported_compute_capability([120, 121])
+@supported_compute_capability([100, 103, 120, 121])
 def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6575,8 +6574,8 @@ def group_gemm_nvfp4_nt_groupwise(
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    r"""Perform group GEMM with NVFP4 data types using groupwise scaling. Currently only implemented on NVIDIA
-    Blackwell Geforce, and DGX Spark architectures.
+    r"""Perform group GEMM with NVFP4 data types using groupwise scaling. Implemented on NVIDIA
+    Blackwell architectures (SM100/SM103 and SM120/SM121).
 
     Parameters
     ----------
@@ -6652,22 +6651,42 @@ def group_gemm_nvfp4_nt_groupwise(
         # empty torch tensor
         alpha = torch.tensor([], dtype=torch.float32, device=a.device)
 
-    get_gemm_sm120_module().group_gemm_nvfp4_nt_groupwise(
-        int_workspace_buffer,
-        float_workspace_buffer,
-        a,
-        b,
-        a_scale,
-        b_scale,
-        out,
-        alpha,
-        m_indptr,
-        n,
-        k,
-        tile_m,
-        tile_n,
-        tile_k,
-    )
+    if is_sm12x_supported(a.device):
+        get_gemm_sm120_module().group_gemm_nvfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            alpha,
+            m_indptr,
+            n,
+            k,
+            tile_m,
+            tile_n,
+            tile_k,
+        )
+    elif is_sm100a_supported(a.device):
+        get_gemm_sm100_module().group_gemm_nvfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            alpha,
+            m_indptr,
+            n,
+            k,
+            tile_m,
+            tile_n,
+            tile_k,
+        )
+    else:
+        raise ValueError(f"Unsupported device for NVFP4 group GEMM: {a.device}")
 
     return out
 

@@ -30,6 +30,15 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM100(TensorView int_workspace_buffer,
                                                int64_t k, int64_t mma_sm, int64_t tile_m,
                                                int64_t tile_n, int64_t tile_k, bool swap_ab);
 
+void CutlassGroupGemmNVFP4GroupwiseScaledSM100(TensorView int_workspace_buffer,
+                                               TensorView float_workspace_buffer, TensorView A,
+                                               TensorView B, TensorView SFA, TensorView SFB,
+                                               TensorView D, TensorView alpha, TensorView m_indptr,
+                                               int64_t n, int64_t k, int64_t tile_m, int64_t tile_n,
+                                               int64_t tile_k);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_fp8_nt_groupwise, CutlassGroupGemmFP8GroupwiseScaledSM100);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp4_nt_groupwise,
                               CutlassGroupGemmMXFP4GroupwiseScaledSM100);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_nvfp4_nt_groupwise,
+                              CutlassGroupGemmNVFP4GroupwiseScaledSM100);

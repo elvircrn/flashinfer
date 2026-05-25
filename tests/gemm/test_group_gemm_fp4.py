@@ -116,9 +116,9 @@ def test_group_gemm_nvfp4(
 ):
     device = torch.device("cuda")
     compute_capability = get_compute_capability(device)
-    if compute_capability[0] not in [12]:
+    if compute_capability[0] not in [10, 12]:
         pytest.skip(
-            "group_gemm_nvfp4_nt_groupwise is only supported on SM120/SM121 GPUs."
+            "group_gemm_nvfp4_nt_groupwise is only supported on SM100/SM103/SM120/SM121 GPUs."
         )
 
     torch.random.manual_seed(0)
