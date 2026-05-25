@@ -155,7 +155,7 @@ cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM100(
         ElementCompute, ElementC, LayoutD*, AlignmentD, ElementD, LayoutD*, AlignmentD,                                                                                \
         EpilogueSchedule>::CollectiveOp;                                                                                                                               \
     using MainloopSchedule =                                                                                                                                           \
-        cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;                                                                                               \
+        cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100;                                                                                               \
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                                                                                  \
         cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp, ElementAMainloop,                                                                             \
         LayoutA*, AlignmentA, ElementBMainloop, LayoutB*, AlignmentB, ElementAccumulator,                                                                              \
@@ -173,7 +173,7 @@ cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM100(
     using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;                                                                                \
     using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;                                                                                \
     constexpr int ScaleGranularity = Gemm::GemmKernel::CollectiveMainloop::TiledMma::SFVecSize;                                                                        \
-    static_assert(ScaleGranularity == 32, "Scale Granularity should be 32");                                                                                           \
+    static_assert(ScaleGranularity == 16, "Scale Granularity should be 16");                                                                                           \
     AlignedAllocator allocator(int_buffer, int_buffer_size_in_bytes);                                                                                                  \
     auto problem_sizes = allocator.aligned_alloc<typename ProblemShape::UnderlyingProblemShape>(                                                                       \
         num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape), 16,                                                                                        \
