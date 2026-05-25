@@ -191,10 +191,10 @@ def main():
         "--m", type=int, nargs="+", default=[128, 512, 1024, 2048, 4096, 8192]
     )
     parser.add_argument(
-        "--n", type=int, nargs="+", default=[1024, 2048, 4096, 8192]
+        "--n", type=int, nargs="+", default=[1024, 2048, 4096, 7168, 8192]
     )
     parser.add_argument(
-        "--k", type=int, nargs="+", default=[1024, 2048, 4096, 8192]
+        "--k", type=int, nargs="+", default=[1024, 2048, 4096, 7168, 8192]
     )
     args = parser.parse_args()
 

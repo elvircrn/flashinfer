@@ -153,8 +153,8 @@ def test_group_gemm_nvfp4(
 
 
 @pytest.mark.parametrize("m", [1, 16, 128, 1024, 4096])
-@pytest.mark.parametrize("n", [128, 512, 2048, 4096])
-@pytest.mark.parametrize("k", [128, 512, 2048, 4096])
+@pytest.mark.parametrize("n", [128, 2048, 7168])
+@pytest.mark.parametrize("k", [128, 2048, 7168])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
 def test_group_gemm_nvfp4_extended(
     m: int,
