@@ -508,10 +508,25 @@ def gen_gemm_sm100_module() -> JitSpec:
             swap_ab=swap_ab,
         )
         write_if_different(dest_path, source)
+    prefix = "group_gemm_nvfp4_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm100_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+    dtype_d_list = [torch.float16, torch.bfloat16]
+    for dtype_d in dtype_d_list:
+        name_dtype_d = filename_safe_dtype_map[dtype_d]
+        dest_path = gen_directory / f"{prefix}_{name_dtype_d}_sm100.cu"
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_a="cutlass::float_e2m1_t",
+            dtype_b="cutlass::float_e2m1_t",
+            dtype_d=dtype_cutlass_map[dtype_d],
+        )
+        write_if_different(dest_path, source)
     for filename in [
         "gemm_groupwise_sm100.cu",
         "group_gemm_fp8_groupwise_sm100.cu",
         "group_gemm_mxfp4_groupwise_sm100.cu",
+        "group_gemm_nvfp4_groupwise_sm100.cu",
         "gemm_sm100_binding.cu",
         "group_gemm_sm100_binding.cu",
     ]:
