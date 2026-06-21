@@ -51,67 +51,11 @@ using namespace conversion;
 //   baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
 //   bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
 //   ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
-template <int colsPerStage, int stateValuesPerBank, int numBanks, int lanesPerRow = 0>
+template <int colsPerStage, int stateValuesPerBank, int numBanks>
 __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
-  constexpr int bankRound = stateValuesPerBank * numBanks;
-  if constexpr (colsPerStage <= bankRound || lanesPerRow == 0) {
-    auto const seq_index = group * colsPerStage + baseCol;
-    auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
-    return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
-  } else {
-    constexpr int numSlots = colsPerStage / stateValuesPerBank;
-    constexpr int itemsPerMember = colsPerStage / lanesPerRow;
-    int member = baseCol / itemsPerMember;
-    int item_index = (baseCol % itemsPerMember) / stateValuesPerBank;
-    int slot = (item_index * lanesPerRow + member + lanesPerRow * group) % numSlots;
-    return slot * stateValuesPerBank;
-  }
-}
-
-// SM100 f32x2 packed SIMD helpers — same as ssu_mtp_common.cuh but in this namespace.
-// On Blackwell, {mul,fma}.f32x2 pack two fp32 ops into one instruction on the FMUL2 pipeline.
-__device__ __forceinline__ void mul_f32x2(float2& c, float2 const& a, float2 const& b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-  asm("mul.f32x2 %0, %1, %2;\n"
-      : "=l"(reinterpret_cast<uint64_t&>(c))
-      : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)));
-#else
-  c.x = a.x * b.x;
-  c.y = a.y * b.y;
-#endif
-}
-
-__device__ __forceinline__ void fma_f32x2(float2& d, float2 const& a, float2 const& b,
-                                          float2 const& c) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-  asm("fma.rn.f32x2 %0, %1, %2, %3;\n"
-      : "=l"(reinterpret_cast<uint64_t&>(d))
-      : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)),
-        "l"(reinterpret_cast<uint64_t const&>(c)));
-#else
-  d.x = a.x * b.x + c.x;
-  d.y = a.y * b.y + c.y;
-#endif
-}
-
-// Tight-spin parity-based barrier wait — avoids cuda::barrier::wait() NANOSLEEP backoff overhead.
-__device__ __forceinline__ void arrive_and_wait_parity(
-    cuda::barrier<cuda::thread_scope_block>& bar, uint32_t& parity) {
-  uint32_t const smem_addr =
-      static_cast<uint32_t>(__cvta_generic_to_shared(cuda::device::barrier_native_handle(bar)));
-  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_addr) : "memory");
-  uint32_t ready = 0;
-  while (!ready) {
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
-        "selp.b32 %0, 1, 0, p;\n"
-        "}\n"
-        : "=r"(ready)
-        : "r"(smem_addr), "r"(parity));
-  }
-  parity ^= 1;
+  auto const seq_index = group * colsPerStage + baseCol;
+  auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
+  return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
 }
 
 template <typename input_t, typename state_scale_t, int rows_per_block, int dstate>
@@ -977,12 +921,65 @@ __device__ __forceinline__ void consumer_func_horizontal(
     // flat_e tracks position across outer+inner loops; refresh every 4 elements.
     // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
     [[maybe_unused]] uint32_t rand_ints[4];
-    {
+    if constexpr (sizeof(state_t) == sizeof(input_t)) {
+#pragma unroll
+      for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
+        auto const baseCol = item + member * itemsPerThread;
+        // If I just use baseCol as the index, a lot of bank conflicts will arise.
+        auto const ii =
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
+
+        auto const i = iBegin + ii;
+
+        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        uint32_t rState = *sState_ptr;
+        auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
+
+        uint32_t rB = *reinterpret_cast<uint32_t const*>(&sram.B[i]);
+        auto* rB_ptr = reinterpret_cast<input_t const*>(&rB);
+
+        uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
+        auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
+
+        for (int e = 0; e < stateValuesPerBank; e++) {
+          int flat_e = item + e;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            if (flat_e % 4 == 0)
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                              rand_ints[0], rand_ints[1], rand_ints[2],
+                                              rand_ints[3]);
+          }
+
+          float state_value;
+          if constexpr (!useStateCache) {
+            state_value = 0.f;
+          } else {
+            state_value = toFloat(rState_ptr[e]);
+          }
+
+          auto const B_value = toFloat(rB_ptr[e]);
+          auto const C_value = toFloat(rC_ptr[e]);
+
+          auto const dA = __expf(A_value * dt_value);
+          auto const dB = B_value * dt_value;
+          auto const new_state = state_value * dA + dB * x_value;
+
+          // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
+          if constexpr (PHILOX_ROUNDS > 0) {
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
+          } else {
+            convertAndStore(&rState_ptr[e], new_state);
+          }
+          out_value += new_state * C_value;
+        }
+        *sState_ptr = rState;
+      }
+    } else {
 #pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
         auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks, lanesPerRow>(group, baseCol);
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
@@ -1045,6 +1042,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
 
+  // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   int const nheads = params.nheads;
@@ -1067,6 +1065,8 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const dst_state_batch =
       dst_sbi ? static_cast<int64_t>(dst_sbi[batch * params.dst_state_batch_indices_stride_batch])
               : state_batch;
+  auto const state_ptr_offset =
+      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
   using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
@@ -1081,15 +1081,13 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
     init(&sram.bar_empty[stage], num_arrivals);
     init(&sram.bar_full[stage], num_arrivals);
+    // signal to async proxy that barriers are initilized
     cde::fence_proxy_async_shared_cta();
   }
   if (lane == 0 && warp == 0) {
     init(&sram.bar_consumers, warpSize * consumerWarps);
   }
   __syncthreads();
-
-  auto const state_ptr_offset =
-      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   if (warp == consumerWarps)  // producer
   {
@@ -1155,6 +1153,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
 
+    // Thread
     float out_value = 0.f;
     if (state_batch != params.pad_slot_id)
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
@@ -1306,8 +1305,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto numProducers = 1;
     constexpr auto numWarps = numProducers + numConsumers;
 
-    constexpr auto maxTMACols = 256 / sizeof(state_t);  // TMA innermost dim limit: 256 bytes
-    constexpr auto stageCols = (DSTATE <= maxTMACols) ? DSTATE : maxTMACols;
+    constexpr auto sectorSize = 32;  // bytes
+    constexpr auto stageCols = 2 * sectorSize / sizeof(state_t);
 
     constexpr auto totalStages = DSTATE / stageCols;
     constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
