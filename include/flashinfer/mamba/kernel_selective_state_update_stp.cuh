@@ -38,10 +38,20 @@ using namespace conversion;
 // This permutation avoids bank conflicts when threads access strided patterns.
 //
 // Path 1 (colsPerStage <= bankRound, or lanesPerRow == 0):
-//   bankCycle offset — shifts each 32-bank round by 1 bank.
-//   Example (stateValuesPerBank=1, numBanks=32, colsPerStage=32):
-//     baseCol:    0  1  2 ... 31
-//     bankCycle:  0  0  0 ...  0   → no shift needed (fits in one round)
+//   Without permutation (baseCol directly):
+//     Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
+//
+//   With permutation (adding bankCycle offset):
+//     bankCycle = which "round" of 32 banks we're in
+//     By offsetting each round by 1 bank:
+//     Thread 0  -> Bank 0
+//     Thread 32 -> Bank 1  (offset by 1)
+//     Thread 64 -> Bank 2  (offset by 2)
+//
+//   Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
+//     baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
+//     bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
+//     ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
 //
 // Path 2 (colsPerStage > bankRound, lanesPerRow > 0):
 //   Slot-interleave — distributes each member's items across banks by interleaving
