@@ -37,20 +37,17 @@ using namespace conversion;
 // Computes a conflict-free column index for shared memory access.
 // This permutation avoids bank conflicts when threads access strided patterns.
 //
-// Without permutation (baseCol directly):
-//   Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
+// Path 1 (colsPerStage <= bankRound, or lanesPerRow == 0):
+//   bankCycle offset — shifts each 32-bank round by 1 bank.
+//   Example (stateValuesPerBank=1, numBanks=32, colsPerStage=32):
+//     baseCol:    0  1  2 ... 31
+//     bankCycle:  0  0  0 ...  0   → no shift needed (fits in one round)
 //
-// With permutation (adding bankCycle offset):
-//   bankCycle = which "round" of 32 banks we're in
-//   By offsetting each round by 1 bank:
-//   Thread 0  -> Bank 0
-//   Thread 32 -> Bank 1  (offset by 1)
-//   Thread 64 -> Bank 2  (offset by 2)
-//
-// Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
-//   baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
-//   bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
-//   ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
+// Path 2 (colsPerStage > bankRound, lanesPerRow > 0):
+//   Slot-interleave — distributes each member's items across banks by interleaving
+//   member index with item index, so threads in different warp-lanes that read the
+//   same column-offset hit distinct banks.
+//   slot = (item_index * lanesPerRow + member + lanesPerRow * group) % numSlots
 template <int colsPerStage, int stateValuesPerBank, int numBanks, int lanesPerRow = 0>
 __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
   constexpr int bankRound = stateValuesPerBank * numBanks;
