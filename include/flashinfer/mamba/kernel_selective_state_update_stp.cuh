@@ -1042,6 +1042,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
     init(&sram.bar_empty[stage], num_arrivals);
     init(&sram.bar_full[stage], num_arrivals);
+    // signal to async proxy that barriers are initilized
     cde::fence_proxy_async_shared_cta();
   }
   if (lane == 0 && warp == 0) {
