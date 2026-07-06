@@ -943,7 +943,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
         auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks, lanesPerRow>(group, baseCol);
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks, lanesPerRow>(group,
+                                                                                          baseCol);
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
