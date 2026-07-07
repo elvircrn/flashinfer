@@ -1007,6 +1007,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
 
+  // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   int const nheads = params.nheads;
