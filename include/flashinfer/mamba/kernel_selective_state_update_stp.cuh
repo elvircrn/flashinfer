@@ -1119,6 +1119,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
 
+    // Thread
     float out_value = 0.f;
     if (state_batch != params.pad_slot_id)
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
