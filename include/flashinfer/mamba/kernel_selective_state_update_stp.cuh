@@ -58,10 +58,12 @@ using namespace conversion;
 //   member index with item index, so threads in different warp-lanes that read the
 //   same column-offset hit distinct banks.
 //   slot = (item_index * lanesPerRow + member + lanesPerRow * group) % numSlots
-template <int colsPerStage, int stateValuesPerBank, int numBanks, int lanesPerRow = 0>
+template <int colsPerStage, int stateValuesPerBank, int numBanks, int lanesPerRow = 0, int forcePermutationType = 0>
 __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
   constexpr int bankRound = stateValuesPerBank * numBanks;
-  if constexpr (colsPerStage <= bankRound || lanesPerRow == 0) {
+  constexpr bool useBankCycle = (forcePermutationType == 1) ||
+                               (forcePermutationType == 0 && (colsPerStage <= bankRound || lanesPerRow == 0));
+  if constexpr (useBankCycle) {
     auto const seq_index = group * colsPerStage + baseCol;
     auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
     return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
@@ -934,6 +936,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
     constexpr auto bankSize = sizeof(uint32_t);
     constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
     constexpr auto numBanks = 32;
+    constexpr auto numSlots = colsPerStage / stateValuesPerBank;
     // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
     // flat_e tracks position across outer+inner loops; refresh every 4 elements.
     // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
@@ -941,10 +944,19 @@ __device__ __forceinline__ void consumer_func_horizontal(
     {
 #pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
-        auto const baseCol = item + member * itemsPerThread;
-        auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks, lanesPerRow>(group,
-                                                                                          baseCol);
+        int ii;
+        if constexpr (FORCE_PERMUTATION_TYPE == 1 ||
+                     (FORCE_PERMUTATION_TYPE == 0 && colsPerStage <= (stateValuesPerBank * 32))) {
+          // bankCycle permutation
+          auto const baseCol = item + member * itemsPerThread;
+          auto const seq_index = group * colsPerStage + baseCol;
+          auto const bankCycle = (seq_index / stateValuesPerBank) / 32;
+          ii = (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+        } else {
+          // slot-interleave permutation (inlined)
+          ii = ((item / stateValuesPerBank * lanesPerRow + member + lanesPerRow * group) % numSlots) * stateValuesPerBank;
+        }
+
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
@@ -1275,7 +1287,9 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto stageCols = (DSTATE <= maxTMACols) ? DSTATE : maxTMACols;
 
     constexpr auto totalStages = DSTATE / stageCols;
-    constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
+    constexpr auto rawStages = (FORCE_NUM_STAGES > 0) ? FORCE_NUM_STAGES :
+                              ((totalStages >= 4) ? 4 : totalStages);
+    constexpr auto numStages = (rawStages > totalStages) ? totalStages : rawStages;
 
     auto ratio_launcher = [&]<int RATIO>() {
       auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<

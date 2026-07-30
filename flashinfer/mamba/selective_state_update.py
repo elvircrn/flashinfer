@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -27,6 +28,34 @@ from ..jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
+
+
+def _get_ssu_tactic_override(dim: int, dstate: int, state_dtype: torch.dtype, device: torch.device):
+    """Get SSU kernel tactic override from environment or autotuner cache.
+
+    Returns:
+        Tuple of (force_num_stages, force_permutation_type) where:
+        - force_num_stages: 0=auto, >0=force specific stage count
+        - force_permutation_type: 0=auto, 1=bankCycle, 2=slot-interleave
+    """
+    # Environment variable override for debugging/testing
+    env_stages = os.environ.get("FLASHINFER_SSU_FORCE_STAGES")
+    env_perm = os.environ.get("FLASHINFER_SSU_FORCE_PERMUTATION")
+
+    if env_stages or env_perm:
+        stages = int(env_stages) if env_stages else 0
+        perm = int(env_perm) if env_perm else 0
+        return stages, perm
+
+    # TODO: Add autotuner integration here
+    # For now, use the current optimized defaults for Blackwell
+    major, _ = get_compute_capability(device)
+    if major >= 10:  # Blackwell: prefer 1-stage + slot-interleave
+        return 1, 2
+    elif major >= 9:  # Hopper: could benefit from different config
+        return 0, 0  # Use auto for now, to be tuned
+    else:
+        return 0, 0  # Pre-Hopper: use auto
 
 
 @functools.cache
@@ -44,6 +73,8 @@ def _get_module(
     sm_major: int,
     state_scale_dtype: Optional[torch.dtype] = None,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
 ):
     args = (
         state_dtype,
@@ -58,6 +89,8 @@ def _get_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds,
+        force_num_stages,
+        force_permutation_type,
     )
     if sm_major >= 10:
         return gen_selective_state_update_sm100_module(*args).build_and_load()
@@ -83,6 +116,10 @@ def get_selective_state_update_module(
     philox_rounds: int = 0,
 ):
     major, _ = get_compute_capability(device)
+    # Get tactic override for this configuration
+    force_num_stages, force_permutation_type = _get_ssu_tactic_override(
+        dim, dstate, state_dtype, device
+    )
     return _get_module(
         state_dtype,
         input_dtype,
@@ -97,6 +134,8 @@ def get_selective_state_update_module(
         major,
         state_scale_dtype,
         philox_rounds,
+        force_num_stages,
+        force_permutation_type,
     )
 
 
@@ -318,6 +357,10 @@ def selective_state_update(
     else:
         ntokens_mtp = 1
 
+    # Parse algorithm parameter for stage/permutation hints
+    force_num_stages = 0
+    force_permutation_type = 0
+
     if algorithm == "auto":
         algorithm_int = 0
     elif algorithm == "simple":
@@ -326,6 +369,18 @@ def selective_state_update(
         algorithm_int = 2
     elif algorithm == "horizontal":
         algorithm_int = 3
+    elif algorithm == "horizontal_1stage":
+        algorithm_int = 3
+        force_num_stages = 1
+    elif algorithm == "horizontal_4stage":
+        algorithm_int = 3
+        force_num_stages = 4
+    elif algorithm == "horizontal_bankcycle":
+        algorithm_int = 3
+        force_permutation_type = 1
+    elif algorithm == "horizontal_slot":
+        algorithm_int = 3
+        force_permutation_type = 2
     elif algorithm == "async_horizontal":
         # Backward compat: async_horizontal is now merged into simple
         algorithm_int = 1
