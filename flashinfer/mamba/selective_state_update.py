@@ -15,12 +15,23 @@ limitations under the License.
 """
 
 import functools
-import os
-from typing import Optional
+from typing import Any, List, Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
+from ..fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
+)
 from ..trace.templates.mamba import selective_state_update_trace
 from ..jit.mamba import (
     gen_selective_state_update_module,
@@ -28,34 +39,6 @@ from ..jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
-
-
-def _get_ssu_tactic_override(dim: int, dstate: int, state_dtype: torch.dtype, device: torch.device):
-    """Get SSU kernel tactic override from environment or autotuner cache.
-
-    Returns:
-        Tuple of (force_num_stages, force_permutation_type) where:
-        - force_num_stages: 0=auto, >0=force specific stage count
-        - force_permutation_type: 0=auto, 1=bankCycle, 2=slot-interleave
-    """
-    # Environment variable override for debugging/testing
-    env_stages = os.environ.get("FLASHINFER_SSU_FORCE_STAGES")
-    env_perm = os.environ.get("FLASHINFER_SSU_FORCE_PERMUTATION")
-
-    if env_stages or env_perm:
-        stages = int(env_stages) if env_stages else 0
-        perm = int(env_perm) if env_perm else 0
-        return stages, perm
-
-    # TODO: Add autotuner integration here
-    # For now, use the current optimized defaults for Blackwell
-    major, _ = get_compute_capability(device)
-    if major >= 10:  # Blackwell: prefer 1-stage + slot-interleave
-        return 1, 2
-    elif major >= 9:  # Hopper: could benefit from different config
-        return 0, 0  # Use auto for now, to be tuned
-    else:
-        return 0, 0  # Pre-Hopper: use auto
 
 
 @functools.cache
@@ -100,43 +83,87 @@ def _get_module(
         return gen_selective_state_update_module(*args).build_and_load()
 
 
-def get_selective_state_update_module(
-    device: torch.device,
-    state_dtype: torch.dtype,
-    input_dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    matrixA_dtype: torch.dtype,
-    stateIndex_dtype: torch.dtype,
-    dim: int,
-    dstate: int,
-    ntokens_mtp: int,
-    cu_seqlens_dtype: torch.dtype,
-    num_accepted_tokens_dtype: torch.dtype,
-    state_scale_dtype: Optional[torch.dtype] = None,
-    philox_rounds: int = 0,
-):
-    major, _ = get_compute_capability(device)
-    # Get tactic override for this configuration
-    force_num_stages, force_permutation_type = _get_ssu_tactic_override(
-        dim, dstate, state_dtype, device
-    )
-    return _get_module(
-        state_dtype,
-        input_dtype,
-        weight_dtype,
-        matrixA_dtype,
-        stateIndex_dtype,
-        dim,
-        dstate,
-        ntokens_mtp,
-        cu_seqlens_dtype,
-        num_accepted_tokens_dtype,
-        major,
-        state_scale_dtype,
-        philox_rounds,
-        force_num_stages,
-        force_permutation_type,
-    )
+class SSUHorizontalRunner(TunableRunner):
+    TACTIC_CONFIGS = {
+        0: (0, 0),
+        1: (1, 1),
+        2: (1, 2),
+        3: (4, 1),
+        4: (4, 2),
+    }
+
+    def __init__(
+        self,
+        module_base_args,
+        dt_softplus,
+        pad_slot_id,
+        disable_state_update,
+        cache_steps,
+        algorithm_int,
+    ):
+        self._module_base_args = module_base_args
+        self._dt_softplus = dt_softplus
+        self._pad_slot_id = pad_slot_id
+        self._disable_state_update = disable_state_update
+        self._cache_steps = cache_steps
+        self._algorithm_int = algorithm_int
+
+    def get_valid_tactics(
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> List[int]:
+        return list(self.TACTIC_CONFIGS.keys())
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            self._module_base_args,
+            self._algorithm_int,
+            inputs[7] is not None,
+            inputs[8] is not None,
+            inputs[12] is not None,
+        )
+
+    def forward(
+        self,
+        inputs: List[Any],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> None:
+        if do_preparation:
+            for stages, perm in self.TACTIC_CONFIGS.values():
+                _get_module(*self._module_base_args, stages, perm)
+            return
+
+        if tactic < 0:
+            force_num_stages, force_permutation_type = 0, 0
+        else:
+            force_num_stages, force_permutation_type = self.TACTIC_CONFIGS[tactic]
+
+        module = _get_module(
+            *self._module_base_args, force_num_stages, force_permutation_type
+        )
+
+        (
+            state, x, dt, A, B, C, D,
+            z, dt_bias, output,
+            state_batch_indices, dst_state_batch_indices,
+            state_scale,
+            intermediate_states_buffer, intermediate_state_indices,
+            intermediate_state_scales, rand_seed,
+            cu_seqlens, num_accepted_tokens,
+        ) = inputs
+
+        module.selective_state_update(
+            state, x, dt, A, B, C, D,
+            z, dt_bias, self._dt_softplus,
+            state_batch_indices, dst_state_batch_indices,
+            self._pad_slot_id, state_scale, output,
+            self._disable_state_update,
+            intermediate_states_buffer, intermediate_state_indices,
+            intermediate_state_scales, rand_seed,
+            self._cache_steps, cu_seqlens, num_accepted_tokens,
+            self._algorithm_int,
+        )
 
 
 @flashinfer_api(trace=selective_state_update_trace)
@@ -421,6 +448,8 @@ def selective_state_update(
         dim,
         dstate,
         ntokens_mtp,
+        force_num_stages,
+        force_permutation_type,
     )
     return output
 
@@ -469,48 +498,93 @@ def _selective_state_update(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
-    get_selective_state_update_module(
-        state.device,
-        state_dtype,
-        input_dtype,
-        weight_dtype,
-        matrixA_dtype,
-        stateIndex_dtype,
-        dim,
-        dstate,
-        ntokens_mtp,
-        cu_seqlens.dtype if cu_seqlens is not None else torch.int32,
-        num_accepted_tokens.dtype if num_accepted_tokens is not None else torch.int64,
-        state_scale_dtype=state_scale.dtype if state_scale is not None else None,
-        philox_rounds=philox_rounds,
-    ).selective_state_update(
-        state,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D,
-        z,
-        dt_bias,
-        dt_softplus,
-        state_batch_indices,
-        dst_state_batch_indices,
-        pad_slot_id,
-        state_scale,
-        output,
-        disable_state_update,
-        intermediate_states_buffer,
-        intermediate_state_indices,
-        intermediate_state_scales,
-        rand_seed,
-        cache_steps,
-        cu_seqlens,
-        num_accepted_tokens,
-        algorithm,
+    major, _ = get_compute_capability(state.device)
+    cu_seqlens_dtype = cu_seqlens.dtype if cu_seqlens is not None else torch.int32
+    na_dtype = (
+        num_accepted_tokens.dtype if num_accepted_tokens is not None else torch.int64
     )
+    state_scale_dtype = state_scale.dtype if state_scale is not None else None
+
+    module_base_args = (
+        state_dtype, input_dtype, weight_dtype, matrixA_dtype,
+        stateIndex_dtype, dim, dstate, ntokens_mtp,
+        cu_seqlens_dtype, na_dtype, major,
+        state_scale_dtype, philox_rounds,
+    )
+
+    if force_num_stages > 0 or force_permutation_type > 0:
+        module = _get_module(
+            *module_base_args, force_num_stages, force_permutation_type
+        )
+        module.selective_state_update(
+            state, x, dt, A, B, C, D,
+            z, dt_bias, dt_softplus,
+            state_batch_indices, dst_state_batch_indices,
+            pad_slot_id, state_scale, output,
+            disable_state_update,
+            intermediate_states_buffer, intermediate_state_indices,
+            intermediate_state_scales, rand_seed,
+            cache_steps, cu_seqlens, num_accepted_tokens,
+            algorithm,
+        )
+        return
+
+    tuner = AutoTuner.get()
+    inputs = [
+        state, x, dt, A, B, C, D,
+        z, dt_bias, output,
+        state_batch_indices, dst_state_batch_indices,
+        state_scale,
+        intermediate_states_buffer, intermediate_state_indices,
+        intermediate_state_scales, rand_seed,
+        cu_seqlens, num_accepted_tokens,
+    ]
+
+    runner = SSUHorizontalRunner(
+        module_base_args=module_base_args,
+        dt_softplus=dt_softplus,
+        pad_slot_id=pad_slot_id,
+        disable_state_update=disable_state_update,
+        cache_steps=cache_steps,
+        algorithm_int=algorithm,
+    )
+
+    batch_input_idx = [1, 2, 4, 5]
+    batch_dim_idx = [0, 0, 0, 0]
+    if z is not None:
+        batch_input_idx.append(7)
+        batch_dim_idx.append(0)
+    if state_batch_indices is not None:
+        batch_input_idx.append(10)
+        batch_dim_idx.append(0)
+    if dst_state_batch_indices is not None:
+        batch_input_idx.append(11)
+        batch_dim_idx.append(0)
+
+    constraint_specs = [
+        ConstraintSpec(9, 0, lambda shapes: shapes[1][0]),
+    ]
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=tuple(batch_input_idx),
+                dim_idx=tuple(batch_dim_idx),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+            ),
+        ),
+        constraint_specs=tuple(constraint_specs),
+    )
+
+    runner, tactic = tuner.choose_one(
+        "ssu_horizontal", [runner], tuning_config, inputs
+    )
+    runner(inputs=inputs, tactic=tactic)
 
 
 @register_fake_op("flashinfer::selective_state_update")
@@ -548,6 +622,8 @@ def _selective_state_update_fake(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
