@@ -59,6 +59,9 @@ def get_selective_state_update_uri(
     cu_seqlens_dtype: torch.dtype,
     num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> str:
     s = _filename_safe_dtype_map
     uri = (
@@ -72,6 +75,12 @@ def get_selective_state_update_uri(
         uri += f"_sc_{s[state_scale_dtype]}"
     if philox_rounds > 0:
         uri += f"_pr_{philox_rounds}"
+    if force_num_stages > 0:
+        uri += f"_fns_{force_num_stages}"
+    if force_permutation_type > 0:
+        uri += f"_fpt_{force_permutation_type}"
+    if force_stage_cols > 0:
+        uri += f"_fstc_{force_stage_cols}"
     return uri
 
 
@@ -89,6 +98,9 @@ def _gen_module(
     cu_seqlens_dtype: torch.dtype,
     num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -116,6 +128,9 @@ def _gen_module(
         ntokens_mtp=ntokens_mtp,
         state_scale_type=state_scale_type,
         philox_rounds=philox_rounds,
+        force_num_stages=force_num_stages,
+        force_permutation_type=force_permutation_type,
+        force_stage_cols=force_stage_cols,
     )
     write_if_different(gen_directory / "selective_state_update_config.inc", config_str)
 
@@ -153,6 +168,9 @@ def gen_selective_state_update_module(
     cu_seqlens_dtype: torch.dtype,
     num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> JitSpec:
     uri = get_selective_state_update_uri(
         state_dtype,
@@ -167,6 +185,9 @@ def gen_selective_state_update_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds,
+        force_num_stages,
+        force_permutation_type,
+        force_stage_cols,
     )
     # The MTP-simple kernel uses cp.async (sm_80+); on pre-Ampere GPUs the
     # JIT will raise "No supported CUDA architectures found" instead of
@@ -187,6 +208,9 @@ def gen_selective_state_update_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds=philox_rounds,
+        force_num_stages=force_num_stages,
+        force_permutation_type=force_permutation_type,
+        force_stage_cols=force_stage_cols,
         extra_cuda_cflags=nvcc_flags,
     )
 
@@ -204,6 +228,9 @@ def gen_selective_state_update_sm90_module(
     cu_seqlens_dtype: torch.dtype,
     num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> JitSpec:
     uri = (
         get_selective_state_update_uri(
@@ -219,6 +246,9 @@ def gen_selective_state_update_sm90_module(
             cu_seqlens_dtype,
             num_accepted_tokens_dtype,
             philox_rounds,
+            force_num_stages,
+            force_permutation_type,
+            force_stage_cols,
         )
         + "_sm90"
     )
@@ -239,6 +269,9 @@ def gen_selective_state_update_sm90_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds=philox_rounds,
+        force_num_stages=force_num_stages,
+        force_permutation_type=force_permutation_type,
+        force_stage_cols=force_stage_cols,
         extra_cuda_cflags=nvcc_flags,
     )
 
@@ -256,6 +289,9 @@ def gen_selective_state_update_sm100_module(
     cu_seqlens_dtype: torch.dtype,
     num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> JitSpec:
     uri = (
         get_selective_state_update_uri(
@@ -271,6 +307,9 @@ def gen_selective_state_update_sm100_module(
             cu_seqlens_dtype,
             num_accepted_tokens_dtype,
             philox_rounds,
+            force_num_stages,
+            force_permutation_type,
+            force_stage_cols,
         )
         + "_sm100"
     )
@@ -293,5 +332,8 @@ def gen_selective_state_update_sm100_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds=philox_rounds,
+        force_num_stages=force_num_stages,
+        force_permutation_type=force_permutation_type,
+        force_stage_cols=force_stage_cols,
         extra_cuda_cflags=nvcc_flags,
     )

@@ -37,25 +37,44 @@ using namespace conversion;
 // Computes a conflict-free column index for shared memory access.
 // This permutation avoids bank conflicts when threads access strided patterns.
 //
-// Without permutation (baseCol directly):
-//   Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
+// Path 1 (colsPerStage <= bankRound, or lanesPerRow == 0):
+//   Without permutation (baseCol directly):
+//     Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
 //
-// With permutation (adding bankCycle offset):
-//   bankCycle = which "round" of 32 banks we're in
-//   By offsetting each round by 1 bank:
-//   Thread 0  -> Bank 0
-//   Thread 32 -> Bank 1  (offset by 1)
-//   Thread 64 -> Bank 2  (offset by 2)
+//   With permutation (adding bankCycle offset):
+//     bankCycle = which "round" of 32 banks we're in
+//     By offsetting each round by 1 bank:
+//     Thread 0  -> Bank 0
+//     Thread 32 -> Bank 1  (offset by 1)
+//     Thread 64 -> Bank 2  (offset by 2)
 //
-// Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
-//   baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
-//   bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
-//   ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
-template <int colsPerStage, int stateValuesPerBank, int numBanks>
+//   Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
+//     baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
+//     bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
+//     ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
+//
+// Path 2 (colsPerStage > bankRound, lanesPerRow > 0):
+//   Slot-interleave — distributes each member's items across banks by interleaving
+//   member index with item index, so threads in different warp-lanes that read the
+//   same column-offset hit distinct banks.
+//   slot = (item_index * lanesPerRow + member + lanesPerRow * group) % numSlots
+template <int colsPerStage, int stateValuesPerBank, int numBanks, int lanesPerRow = 0, int forcePermutationType = 0>
 __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
-  auto const seq_index = group * colsPerStage + baseCol;
-  auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
-  return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+  constexpr int bankRound = stateValuesPerBank * numBanks;
+  constexpr bool useBankCycle = (forcePermutationType == 1) ||
+                               (forcePermutationType == 0 && (colsPerStage <= bankRound || lanesPerRow == 0));
+  if constexpr (useBankCycle) {
+    auto const seq_index = group * colsPerStage + baseCol;
+    auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
+    return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+  } else {
+    constexpr int numSlots = colsPerStage / stateValuesPerBank;
+    constexpr int itemsPerMember = colsPerStage / lanesPerRow;
+    int member = baseCol / itemsPerMember;
+    int item_index = (baseCol % itemsPerMember) / stateValuesPerBank;
+    int slot = (item_index * lanesPerRow + member + lanesPerRow * group) % numSlots;
+    return slot * stateValuesPerBank;
+  }
 }
 
 template <typename input_t, typename state_scale_t, int rows_per_block, int dstate>
@@ -917,69 +936,27 @@ __device__ __forceinline__ void consumer_func_horizontal(
     constexpr auto bankSize = sizeof(uint32_t);
     constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
     constexpr auto numBanks = 32;
+    constexpr auto numSlots = colsPerStage / stateValuesPerBank;
     // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
     // flat_e tracks position across outer+inner loops; refresh every 4 elements.
     // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
     [[maybe_unused]] uint32_t rand_ints[4];
-    if constexpr (sizeof(state_t) == sizeof(input_t)) {
+    {
 #pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
-        auto const baseCol = item + member * itemsPerThread;
-        // If I just use baseCol as the index, a lot of bank conflicts will arise.
-        auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
-
-        auto const i = iBegin + ii;
-
-        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
-        uint32_t rState = *sState_ptr;
-        auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
-
-        uint32_t rB = *reinterpret_cast<uint32_t const*>(&sram.B[i]);
-        auto* rB_ptr = reinterpret_cast<input_t const*>(&rB);
-
-        uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
-        auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
-
-        for (int e = 0; e < stateValuesPerBank; e++) {
-          int flat_e = item + e;
-          if constexpr (PHILOX_ROUNDS > 0) {
-            if (flat_e % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
-                                              rand_ints[0], rand_ints[1], rand_ints[2],
-                                              rand_ints[3]);
-          }
-
-          float state_value;
-          if constexpr (!useStateCache) {
-            state_value = 0.f;
-          } else {
-            state_value = toFloat(rState_ptr[e]);
-          }
-
-          auto const B_value = toFloat(rB_ptr[e]);
-          auto const C_value = toFloat(rC_ptr[e]);
-
-          auto const dA = __expf(A_value * dt_value);
-          auto const dB = B_value * dt_value;
-          auto const new_state = state_value * dA + dB * x_value;
-
-          // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
-          if constexpr (PHILOX_ROUNDS > 0) {
-            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
-          } else {
-            convertAndStore(&rState_ptr[e], new_state);
-          }
-          out_value += new_state * C_value;
+        int ii;
+        if constexpr (FORCE_PERMUTATION_TYPE == 1 ||
+                     (FORCE_PERMUTATION_TYPE == 0 && colsPerStage <= (stateValuesPerBank * 32))) {
+          // bankCycle permutation
+          auto const baseCol = item + member * itemsPerThread;
+          auto const seq_index = group * colsPerStage + baseCol;
+          auto const bankCycle = (seq_index / stateValuesPerBank) / 32;
+          ii = (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+        } else {
+          // slot-interleave permutation (inlined)
+          ii = ((item / stateValuesPerBank * lanesPerRow + member + lanesPerRow * group) % numSlots) * stateValuesPerBank;
         }
-        *sState_ptr = rState;
-      }
-    } else {
-#pragma unroll
-      for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
-        auto const baseCol = item + member * itemsPerThread;
-        auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
+
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
@@ -1065,8 +1042,6 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const dst_state_batch =
       dst_sbi ? static_cast<int64_t>(dst_sbi[batch * params.dst_state_batch_indices_stride_batch])
               : state_batch;
-  auto const state_ptr_offset =
-      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
   using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
@@ -1088,6 +1063,9 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     init(&sram.bar_consumers, warpSize * consumerWarps);
   }
   __syncthreads();
+
+  auto const state_ptr_offset =
+      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   if (warp == consumerWarps)  // producer
   {
@@ -1305,11 +1283,14 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto numProducers = 1;
     constexpr auto numWarps = numProducers + numConsumers;
 
-    constexpr auto sectorSize = 32;  // bytes
-    constexpr auto stageCols = 2 * sectorSize / sizeof(state_t);
+    constexpr auto maxTMACols = 256 / sizeof(state_t);  // TMA innermost dim limit: 256 bytes
+    constexpr auto autoStageCols = (DSTATE <= maxTMACols) ? DSTATE : maxTMACols;
+    constexpr auto stageCols = (FORCE_STAGE_COLS > 0) ? FORCE_STAGE_COLS : autoStageCols;
 
     constexpr auto totalStages = DSTATE / stageCols;
-    constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
+    constexpr auto rawStages = (FORCE_NUM_STAGES > 0) ? FORCE_NUM_STAGES :
+                              ((totalStages >= 4) ? 4 : totalStages);
+    constexpr auto numStages = (rawStages > totalStages) ? totalStages : rawStages;
 
     auto ratio_launcher = [&]<int RATIO>() {
       auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<

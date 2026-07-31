@@ -15,11 +15,23 @@ limitations under the License.
 """
 
 import functools
-from typing import Optional
+from typing import Any, List, Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
+from ..fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
+)
 from ..trace.templates.mamba import selective_state_update_trace
 from ..jit.mamba import (
     gen_selective_state_update_module,
@@ -44,6 +56,9 @@ def _get_module(
     sm_major: int,
     state_scale_dtype: Optional[torch.dtype] = None,
     philox_rounds: int = 0,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ):
     args = (
         state_dtype,
@@ -58,6 +73,9 @@ def _get_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds,
+        force_num_stages,
+        force_permutation_type,
+        force_stage_cols,
     )
     if sm_major >= 10:
         return gen_selective_state_update_sm100_module(*args).build_and_load()
@@ -67,37 +85,95 @@ def _get_module(
         return gen_selective_state_update_module(*args).build_and_load()
 
 
-def get_selective_state_update_module(
-    device: torch.device,
-    state_dtype: torch.dtype,
-    input_dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    matrixA_dtype: torch.dtype,
-    stateIndex_dtype: torch.dtype,
-    dim: int,
-    dstate: int,
-    ntokens_mtp: int,
-    cu_seqlens_dtype: torch.dtype,
-    num_accepted_tokens_dtype: torch.dtype,
-    state_scale_dtype: Optional[torch.dtype] = None,
-    philox_rounds: int = 0,
-):
-    major, _ = get_compute_capability(device)
-    return _get_module(
-        state_dtype,
-        input_dtype,
-        weight_dtype,
-        matrixA_dtype,
-        stateIndex_dtype,
-        dim,
-        dstate,
-        ntokens_mtp,
-        cu_seqlens_dtype,
-        num_accepted_tokens_dtype,
-        major,
-        state_scale_dtype,
-        philox_rounds,
-    )
+class SSUHorizontalRunner(TunableRunner):
+    TACTIC_CONFIGS = {
+        0: (0, 0, 0),
+        1: (1, 1, 0),
+        2: (1, 2, 0),
+        3: (4, 1, 0),
+        4: (4, 2, 0),
+        5: (1, 1, 64),
+        6: (1, 2, 64),
+        7: (2, 1, 64),
+        8: (2, 2, 64),
+        9: (1, 1, 32),
+        10: (1, 2, 32),
+        11: (4, 1, 32),
+        12: (4, 2, 32),
+    }
+
+    def __init__(
+        self,
+        module_base_args,
+        dt_softplus,
+        pad_slot_id,
+        disable_state_update,
+        cache_steps,
+        algorithm_int,
+    ):
+        self._module_base_args = module_base_args
+        self._dt_softplus = dt_softplus
+        self._pad_slot_id = pad_slot_id
+        self._disable_state_update = disable_state_update
+        self._cache_steps = cache_steps
+        self._algorithm_int = algorithm_int
+
+    def get_valid_tactics(
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> List[int]:
+        return list(self.TACTIC_CONFIGS.keys())
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            self._module_base_args,
+            self._algorithm_int,
+            inputs[7] is not None,
+            inputs[8] is not None,
+            inputs[12] is not None,
+        )
+
+    def forward(
+        self,
+        inputs: List[Any],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> None:
+        if do_preparation:
+            for stages, perm, sc in self.TACTIC_CONFIGS.values():
+                _get_module(*self._module_base_args, stages, perm, sc)
+            return
+
+        if tactic < 0:
+            force_num_stages, force_permutation_type, force_stage_cols = 0, 0, 0
+        else:
+            force_num_stages, force_permutation_type, force_stage_cols = self.TACTIC_CONFIGS[tactic]
+
+        module = _get_module(
+            *self._module_base_args, force_num_stages, force_permutation_type, force_stage_cols
+        )
+
+        (
+            state, x, dt, A, B, C, D,
+            z, dt_bias, output,
+            state_batch_indices, dst_state_batch_indices,
+            state_scale,
+            intermediate_states_buffer, intermediate_state_indices,
+            intermediate_state_scales, rand_seed,
+            cu_seqlens, num_accepted_tokens,
+        ) = inputs
+
+        module.selective_state_update(
+            state, x, dt, A, B, C, D,
+            z, dt_bias, self._dt_softplus,
+            state_batch_indices, dst_state_batch_indices,
+            self._pad_slot_id, state_scale, output,
+            self._disable_state_update,
+            intermediate_states_buffer, intermediate_state_indices,
+            intermediate_state_scales, rand_seed,
+            self._cache_steps, cu_seqlens, num_accepted_tokens,
+            self._algorithm_int,
+        )
 
 
 @flashinfer_api(trace=selective_state_update_trace)
@@ -318,6 +394,10 @@ def selective_state_update(
     else:
         ntokens_mtp = 1
 
+    # Parse algorithm parameter for stage/permutation hints
+    force_num_stages = 0
+    force_permutation_type = 0
+
     if algorithm == "auto":
         algorithm_int = 0
     elif algorithm == "simple":
@@ -326,6 +406,18 @@ def selective_state_update(
         algorithm_int = 2
     elif algorithm == "horizontal":
         algorithm_int = 3
+    elif algorithm == "horizontal_1stage":
+        algorithm_int = 3
+        force_num_stages = 1
+    elif algorithm == "horizontal_4stage":
+        algorithm_int = 3
+        force_num_stages = 4
+    elif algorithm == "horizontal_bankcycle":
+        algorithm_int = 3
+        force_permutation_type = 1
+    elif algorithm == "horizontal_slot":
+        algorithm_int = 3
+        force_permutation_type = 2
     elif algorithm == "async_horizontal":
         # Backward compat: async_horizontal is now merged into simple
         algorithm_int = 1
@@ -366,6 +458,9 @@ def selective_state_update(
         dim,
         dstate,
         ntokens_mtp,
+        force_num_stages,
+        force_permutation_type,
+        0,
     )
     return output
 
@@ -414,48 +509,111 @@ def _selective_state_update(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
-    get_selective_state_update_module(
-        state.device,
-        state_dtype,
-        input_dtype,
-        weight_dtype,
-        matrixA_dtype,
-        stateIndex_dtype,
-        dim,
-        dstate,
-        ntokens_mtp,
-        cu_seqlens.dtype if cu_seqlens is not None else torch.int32,
-        num_accepted_tokens.dtype if num_accepted_tokens is not None else torch.int64,
-        state_scale_dtype=state_scale.dtype if state_scale is not None else None,
-        philox_rounds=philox_rounds,
-    ).selective_state_update(
-        state,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D,
-        z,
-        dt_bias,
-        dt_softplus,
-        state_batch_indices,
-        dst_state_batch_indices,
-        pad_slot_id,
-        state_scale,
-        output,
-        disable_state_update,
-        intermediate_states_buffer,
-        intermediate_state_indices,
-        intermediate_state_scales,
-        rand_seed,
-        cache_steps,
-        cu_seqlens,
-        num_accepted_tokens,
-        algorithm,
+    major, _ = get_compute_capability(state.device)
+    cu_seqlens_dtype = cu_seqlens.dtype if cu_seqlens is not None else torch.int32
+    na_dtype = (
+        num_accepted_tokens.dtype if num_accepted_tokens is not None else torch.int64
     )
+    state_scale_dtype = state_scale.dtype if state_scale is not None else None
+
+    module_base_args = (
+        state_dtype, input_dtype, weight_dtype, matrixA_dtype,
+        stateIndex_dtype, dim, dstate, ntokens_mtp,
+        cu_seqlens_dtype, na_dtype, major,
+        state_scale_dtype, philox_rounds,
+    )
+
+    if force_num_stages > 0 or force_permutation_type > 0 or force_stage_cols > 0:
+        module = _get_module(
+            *module_base_args, force_num_stages, force_permutation_type, force_stage_cols
+        )
+        module.selective_state_update(
+            state, x, dt, A, B, C, D,
+            z, dt_bias, dt_softplus,
+            state_batch_indices, dst_state_batch_indices,
+            pad_slot_id, state_scale, output,
+            disable_state_update,
+            intermediate_states_buffer, intermediate_state_indices,
+            intermediate_state_scales, rand_seed,
+            cache_steps, cu_seqlens, num_accepted_tokens,
+            algorithm,
+        )
+        return
+
+    tuner = AutoTuner.get()
+    inputs = [
+        state, x, dt, A, B, C, D,
+        z, dt_bias, output,
+        state_batch_indices, dst_state_batch_indices,
+        state_scale,
+        intermediate_states_buffer, intermediate_state_indices,
+        intermediate_state_scales, rand_seed,
+        cu_seqlens, num_accepted_tokens,
+    ]
+
+    runner = SSUHorizontalRunner(
+        module_base_args=module_base_args,
+        dt_softplus=dt_softplus,
+        pad_slot_id=pad_slot_id,
+        disable_state_update=disable_state_update,
+        cache_steps=cache_steps,
+        algorithm_int=algorithm,
+    )
+
+    _default_init = lambda shapes, dtype, device: (
+        torch.rand(shapes, device=device) * 10 - 5
+    ).to(dtype)
+
+    def _init_dt(shapes, dtype, device):
+        bs, H_dim, D_dim = shapes
+        base = (torch.rand((bs, H_dim), device=device) * 10 - 5).to(dtype)
+        return base.as_strided((bs, H_dim, D_dim), (H_dim, 1, 0))
+
+    def _init_indices(shapes, dtype, device):
+        return torch.arange(shapes[0], dtype=dtype, device=device)
+
+    batch_input_idx = [1, 2, 4, 5]
+    batch_dim_idx = [0, 0, 0, 0]
+    tensor_inits = [_default_init, _init_dt, _default_init, _default_init]
+    if z is not None:
+        batch_input_idx.append(7)
+        batch_dim_idx.append(0)
+        tensor_inits.append(_default_init)
+    if state_batch_indices is not None:
+        batch_input_idx.append(10)
+        batch_dim_idx.append(0)
+        tensor_inits.append(_init_indices)
+    if dst_state_batch_indices is not None:
+        batch_input_idx.append(11)
+        batch_dim_idx.append(0)
+        tensor_inits.append(_init_indices)
+
+    constraint_specs = [
+        ConstraintSpec(9, 0, lambda shapes: shapes[1][0]),
+    ]
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=tuple(batch_input_idx),
+                dim_idx=tuple(batch_dim_idx),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                tensor_initializers=tensor_inits,
+            ),
+        ),
+        constraint_specs=tuple(constraint_specs),
+    )
+
+    runner, tactic = tuner.choose_one(
+        "ssu_horizontal", [runner], tuning_config, inputs
+    )
+    runner(inputs=inputs, tactic=tactic)
 
 
 @register_fake_op("flashinfer::selective_state_update")
@@ -493,6 +651,9 @@ def _selective_state_update_fake(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    force_num_stages: int = 0,
+    force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
