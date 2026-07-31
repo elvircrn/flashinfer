@@ -553,17 +553,33 @@ def _selective_state_update(
         algorithm_int=algorithm,
     )
 
+    _default_init = lambda shapes, dtype, device: (
+        torch.rand(shapes, device=device) * 10 - 5
+    ).to(dtype)
+
+    def _init_dt(shapes, dtype, device):
+        bs, H_dim, D_dim = shapes
+        base = (torch.rand((bs, H_dim), device=device) * 10 - 5).to(dtype)
+        return base.as_strided((bs, H_dim, D_dim), (H_dim, 1, 0))
+
+    def _init_indices(shapes, dtype, device):
+        return torch.arange(shapes[0], dtype=dtype, device=device)
+
     batch_input_idx = [1, 2, 4, 5]
     batch_dim_idx = [0, 0, 0, 0]
+    tensor_inits = [_default_init, _init_dt, _default_init, _default_init]
     if z is not None:
         batch_input_idx.append(7)
         batch_dim_idx.append(0)
+        tensor_inits.append(_default_init)
     if state_batch_indices is not None:
         batch_input_idx.append(10)
         batch_dim_idx.append(0)
+        tensor_inits.append(_init_indices)
     if dst_state_batch_indices is not None:
         batch_input_idx.append(11)
         batch_dim_idx.append(0)
+        tensor_inits.append(_init_indices)
 
     constraint_specs = [
         ConstraintSpec(9, 0, lambda shapes: shapes[1][0]),
@@ -576,6 +592,7 @@ def _selective_state_update(
                 dim_idx=tuple(batch_dim_idx),
                 gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                 map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                tensor_initializers=tensor_inits,
             ),
         ),
         constraint_specs=tuple(constraint_specs),
