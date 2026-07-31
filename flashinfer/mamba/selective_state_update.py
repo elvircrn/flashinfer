@@ -58,6 +58,7 @@ def _get_module(
     philox_rounds: int = 0,
     force_num_stages: int = 0,
     force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ):
     args = (
         state_dtype,
@@ -74,6 +75,7 @@ def _get_module(
         philox_rounds,
         force_num_stages,
         force_permutation_type,
+        force_stage_cols,
     )
     if sm_major >= 10:
         return gen_selective_state_update_sm100_module(*args).build_and_load()
@@ -85,11 +87,19 @@ def _get_module(
 
 class SSUHorizontalRunner(TunableRunner):
     TACTIC_CONFIGS = {
-        0: (0, 0),
-        1: (1, 1),
-        2: (1, 2),
-        3: (4, 1),
-        4: (4, 2),
+        0: (0, 0, 0),
+        1: (1, 1, 0),
+        2: (1, 2, 0),
+        3: (4, 1, 0),
+        4: (4, 2, 0),
+        5: (1, 1, 64),
+        6: (1, 2, 64),
+        7: (2, 1, 64),
+        8: (2, 2, 64),
+        9: (1, 1, 32),
+        10: (1, 2, 32),
+        11: (4, 1, 32),
+        12: (4, 2, 32),
     }
 
     def __init__(
@@ -130,17 +140,17 @@ class SSUHorizontalRunner(TunableRunner):
         **kwargs,
     ) -> None:
         if do_preparation:
-            for stages, perm in self.TACTIC_CONFIGS.values():
-                _get_module(*self._module_base_args, stages, perm)
+            for stages, perm, sc in self.TACTIC_CONFIGS.values():
+                _get_module(*self._module_base_args, stages, perm, sc)
             return
 
         if tactic < 0:
-            force_num_stages, force_permutation_type = 0, 0
+            force_num_stages, force_permutation_type, force_stage_cols = 0, 0, 0
         else:
-            force_num_stages, force_permutation_type = self.TACTIC_CONFIGS[tactic]
+            force_num_stages, force_permutation_type, force_stage_cols = self.TACTIC_CONFIGS[tactic]
 
         module = _get_module(
-            *self._module_base_args, force_num_stages, force_permutation_type
+            *self._module_base_args, force_num_stages, force_permutation_type, force_stage_cols
         )
 
         (
@@ -450,6 +460,7 @@ def selective_state_update(
         ntokens_mtp,
         force_num_stages,
         force_permutation_type,
+        0,
     )
     return output
 
@@ -500,6 +511,7 @@ def _selective_state_update(
     ntokens_mtp: int,
     force_num_stages: int = 0,
     force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
     major, _ = get_compute_capability(state.device)
@@ -516,9 +528,9 @@ def _selective_state_update(
         state_scale_dtype, philox_rounds,
     )
 
-    if force_num_stages > 0 or force_permutation_type > 0:
+    if force_num_stages > 0 or force_permutation_type > 0 or force_stage_cols > 0:
         module = _get_module(
-            *module_base_args, force_num_stages, force_permutation_type
+            *module_base_args, force_num_stages, force_permutation_type, force_stage_cols
         )
         module.selective_state_update(
             state, x, dt, A, B, C, D,
@@ -641,6 +653,7 @@ def _selective_state_update_fake(
     ntokens_mtp: int,
     force_num_stages: int = 0,
     force_permutation_type: int = 0,
+    force_stage_cols: int = 0,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass

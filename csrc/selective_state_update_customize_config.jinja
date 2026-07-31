@@ -23,3 +23,4 @@ constexpr int PHILOX_ROUNDS = {{ philox_rounds }};
 // SSU kernel configuration
 constexpr int FORCE_NUM_STAGES = {{ force_num_stages }};  // 0 = auto, >0 = force this count
 constexpr int FORCE_PERMUTATION_TYPE = {{ force_permutation_type }};  // 0 = auto, 1 = bankCycle, 2 = slot-interleave
+constexpr int FORCE_STAGE_COLS = {{ force_stage_cols }};  // 0 = auto, >0 = force columns per TMA stage

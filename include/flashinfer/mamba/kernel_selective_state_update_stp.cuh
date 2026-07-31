@@ -1284,7 +1284,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto numWarps = numProducers + numConsumers;
 
     constexpr auto maxTMACols = 256 / sizeof(state_t);  // TMA innermost dim limit: 256 bytes
-    constexpr auto stageCols = (DSTATE <= maxTMACols) ? DSTATE : maxTMACols;
+    constexpr auto autoStageCols = (DSTATE <= maxTMACols) ? DSTATE : maxTMACols;
+    constexpr auto stageCols = (FORCE_STAGE_COLS > 0) ? FORCE_STAGE_COLS : autoStageCols;
 
     constexpr auto totalStages = DSTATE / stageCols;
     constexpr auto rawStages = (FORCE_NUM_STAGES > 0) ? FORCE_NUM_STAGES :
